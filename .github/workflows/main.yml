@@ -1,0 +1,644 @@
+name: Windows Hermes Agent - Mobile Terminal
+
+on:
+workflow_dispatch:
+
+jobs:
+hermes:
+runs-on: windows-latest
+timeout-minutes: 360
+
+steps:
+
+  # ============================================================
+  # 1. Install Hermes Agent
+  # ============================================================
+  - name: Install Hermes Agent
+    shell: pwsh
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      Write-Host "=========================================="
+      Write-Host " Installing Hermes Agent"
+      Write-Host "=========================================="
+
+      # Official Hermes Windows installer
+      iex (irm https://hermes-agent.nousresearch.com/install.ps1)
+
+      # Refresh PATH for this PowerShell process
+      $hermesScripts = "$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts"
+      $hermesBin = "$env:LOCALAPPDATA\hermes\bin"
+
+      $env:PATH = "$hermesScripts;$hermesBin;$env:PATH"
+
+      Write-Host ""
+      Write-Host "Hermes executable:"
+      Get-Command hermes -ErrorAction SilentlyContinue
+
+      hermes --version
+
+      Write-Host ""
+      Write-Host "Hermes installation completed."
+
+  # ============================================================
+  # 2. Verify Hermes
+  # ============================================================
+  - name: Verify Hermes
+    shell: pwsh
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      $hermesScripts = "$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts"
+      $env:PATH = "$hermesScripts;$env:PATH"
+
+      Write-Host "Testing Hermes..."
+
+      hermes --version
+
+      Write-Host ""
+      Write-Host "Running Hermes doctor..."
+      hermes doctor
+
+  # ============================================================
+  # 3. Prepare Workspace
+  # ============================================================
+  - name: Prepare Workspace
+    shell: pwsh
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      New-Item `
+        -ItemType Directory `
+        -Force `
+        -Path "C:\HermesWorkspace" | Out-Null
+
+      @"
+      ==================================================
+      Hermes Agent - Windows GitHub Actions Environment
+      ==================================================
+
+      Hermes installation:
+      $env:LOCALAPPDATA\hermes
+
+      Workspace:
+      C:\HermesWorkspace
+
+      Useful commands:
+
+      hermes setup
+      hermes model
+      hermes doctor
+      hermes
+
+      ==================================================
+      "@ | Out-File `
+        -FilePath "C:\HermesWorkspace\README.txt" `
+        -Encoding utf8
+
+  # ============================================================
+  # 4. Install ttyd
+  # ============================================================
+  - name: Install ttyd
+    shell: pwsh
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      Write-Host "Downloading ttyd..."
+
+      Invoke-WebRequest `
+        -Uri "https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.win32.exe" `
+        -OutFile "C:\ttyd.exe"
+
+      if (-not (Test-Path "C:\ttyd.exe")) {
+          throw "ttyd download failed."
+      }
+
+      Write-Host "ttyd installed."
+
+  # ============================================================
+  # 5. Install Cloudflared
+  # ============================================================
+  - name: Install Cloudflared
+    shell: pwsh
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      choco install cloudflared -y --no-progress
+
+      cloudflared --version
+
+  # ============================================================
+  # 6. Create Mobile Terminal Wrapper
+  # ============================================================
+  - name: Create Mobile Terminal
+    shell: pwsh
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      New-Item `
+        -ItemType Directory `
+        -Force `
+        -Path "C:\HermesTerminal" | Out-Null
+
+      @'
+      <!DOCTYPE html>
+      <html lang="en">
+
+      <head>
+        <meta charset="UTF-8">
+
+        <meta
+          name="viewport"
+          content="width=device-width,
+                   initial-scale=1,
+                   maximum-scale=1,
+                   user-scalable=no">
+
+        <meta name="theme-color" content="#111318">
+
+        <title>Hermes Terminal</title>
+
+        <style>
+
+          * {
+            box-sizing: border-box;
+          }
+
+          html,
+          body {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background: #111318;
+            color: white;
+            font-family:
+              -apple-system,
+              BlinkMacSystemFont,
+              "Segoe UI",
+              sans-serif;
+          }
+
+          #app {
+            width: 100%;
+            height: 100%;
+            display: flex;
+            flex-direction: column;
+          }
+
+          #toolbar {
+            flex-shrink: 0;
+            display: flex;
+            gap: 6px;
+            padding: 7px;
+            background: #1b1e26;
+            border-bottom: 1px solid #303541;
+            overflow-x: auto;
+            -webkit-overflow-scrolling: touch;
+          }
+
+          button {
+            flex-shrink: 0;
+            min-width: 58px;
+            height: 42px;
+
+            border: 1px solid #454b59;
+            border-radius: 8px;
+
+            background: #292e39;
+            color: #ffffff;
+
+            font-size: 14px;
+            font-weight: 600;
+
+            touch-action: manipulation;
+            user-select: none;
+            -webkit-user-select: none;
+          }
+
+          button:active {
+            transform: scale(0.95);
+            background: #414858;
+          }
+
+          .danger {
+            background: #8e3f48;
+            border-color: #b55a65;
+          }
+
+          .primary {
+            background: #38577c;
+            border-color: #527eae;
+          }
+
+          #terminal {
+            flex: 1;
+            width: 100%;
+            height: 100%;
+            border: 0;
+            background: #000;
+          }
+
+          #status {
+            position: fixed;
+            right: 8px;
+            bottom: 8px;
+
+            padding: 5px 8px;
+
+            border-radius: 6px;
+
+            background: rgba(0,0,0,.7);
+
+            color: #aaa;
+            font-size: 11px;
+
+            pointer-events: none;
+          }
+
+        </style>
+      </head>
+
+      <body>
+
+        <div id="app">
+
+          <div id="toolbar">
+
+            <button
+              class="danger"
+              onclick="key('CTRL_C')">
+              Ctrl+C
+            </button>
+
+            <button
+              class="primary"
+              onclick="key('UP')">
+              ▲
+            </button>
+
+            <button
+              class="primary"
+              onclick="key('DOWN')">
+              ▼
+            </button>
+
+            <button
+              onclick="key('LEFT')">
+              ◀
+            </button>
+
+            <button
+              onclick="key('RIGHT')">
+              ▶
+            </button>
+
+            <button
+              onclick="key('TAB')">
+              TAB
+            </button>
+
+            <button
+              onclick="key('ESC')">
+              ESC
+            </button>
+
+            <button
+              class="primary"
+              onclick="key('ENTER')">
+              ENTER
+            </button>
+
+            <button
+              onclick="key('BACKSPACE')">
+              ⌫
+            </button>
+
+          </div>
+
+          <iframe
+            id="terminal"
+            src="/terminal/"
+            allow="clipboard-read; clipboard-write">
+          </iframe>
+
+        </div>
+
+        <div id="status">
+          Hermes Terminal
+        </div>
+
+        <script>
+
+          function key(k) {
+
+            fetch(
+              "/key/" +
+              encodeURIComponent(k),
+              {
+                method: "POST"
+              }
+            ).catch(() => {});
+
+            const frame =
+              document.getElementById("terminal");
+
+            frame.focus();
+          }
+
+        </script>
+
+      </body>
+      </html>
+      '@ | Out-File `
+        -FilePath "C:\HermesTerminal\index.html" `
+        -Encoding utf8
+
+  # ============================================================
+  # 7. Start ttyd
+  # ============================================================
+  - name: Start ttyd
+    shell: pwsh
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      $hermesScripts =
+        "$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts"
+
+      $env:PATH =
+        "$hermesScripts;$env:PATH"
+
+      $log = "C:\ttyd.log"
+
+      if (Test-Path $log) {
+          Remove-Item $log -Force
+      }
+
+      Write-Host "Starting ttyd..."
+
+      $ttydArgs = @(
+        "-p", "7681",
+        "-i", "127.0.0.1",
+        "-W",
+        "-w", "C:\HermesWorkspace",
+        "-t", "fontSize=14",
+        "powershell.exe",
+        "-NoLogo",
+        "-NoExit"
+      )
+
+      $p = Start-Process `
+        -FilePath "C:\ttyd.exe" `
+        -ArgumentList $ttydArgs `
+        -RedirectStandardOutput $log `
+        -RedirectStandardError "C:\ttyd-error.log" `
+        -PassThru
+
+      $p.Id | Out-File "C:\ttyd.pid"
+
+      Write-Host "ttyd PID: $($p.Id)"
+
+      $ready = $false
+
+      for ($i = 1; $i -le 30; $i++) {
+
+          Start-Sleep -Seconds 1
+
+          $test = Test-NetConnection `
+            -ComputerName 127.0.0.1 `
+            -Port 7681 `
+            -WarningAction SilentlyContinue
+
+          if ($test.TcpTestSucceeded) {
+              $ready = $true
+              break
+          }
+      }
+
+      if (-not $ready) {
+
+          Write-Host "===== ttyd stdout ====="
+
+          if (Test-Path $log) {
+              Get-Content $log
+          }
+
+          Write-Host "===== ttyd stderr ====="
+
+          if (Test-Path "C:\ttyd-error.log") {
+              Get-Content "C:\ttyd-error.log"
+          }
+
+          throw "ttyd failed to start."
+      }
+
+      Write-Host "ttyd is ready."
+
+  # ============================================================
+  # 8. Start Cloudflare Tunnel
+  # ============================================================
+  - name: Start Cloudflare Tunnel
+    shell: pwsh
+    env:
+      TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+    run: |
+      $ErrorActionPreference = "Stop"
+
+      $log = "C:\cloudflared.log"
+
+      if (Test-Path $log) {
+          Remove-Item $log -Force
+      }
+
+      Write-Host "Starting Cloudflare Quick Tunnel..."
+
+      $p = Start-Process `
+        -FilePath "cloudflared" `
+        -ArgumentList @(
+          "tunnel",
+          "--no-autoupdate",
+          "--url",
+          "http://127.0.0.1:7681"
+        ) `
+        -RedirectStandardOutput $log `
+        -RedirectStandardError "C:\cloudflared-error.log" `
+        -PassThru
+
+      $p.Id | Out-File "C:\cloudflared.pid"
+
+      Write-Host "cloudflared PID: $($p.Id)"
+
+      $TunnelUrl = $null
+
+      for ($i = 1; $i -le 60; $i++) {
+
+          Start-Sleep -Seconds 2
+
+          $combined = ""
+
+          if (Test-Path $log) {
+              $combined += Get-Content $log -Raw
+          }
+
+          if (Test-Path "C:\cloudflared-error.log") {
+              $combined += Get-Content "C:\cloudflared-error.log" -Raw
+          }
+
+          $match = [regex]::Match(
+            $combined,
+            'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
+          )
+
+          if ($match.Success) {
+              $TunnelUrl = $match.Value
+              break
+          }
+
+          Write-Host "Waiting for tunnel... $i/60"
+      }
+
+      if (-not $TunnelUrl) {
+
+          Write-Host "===== cloudflared stdout ====="
+
+          if (Test-Path $log) {
+              Get-Content $log
+          }
+
+          Write-Host "===== cloudflared stderr ====="
+
+          if (Test-Path "C:\cloudflared-error.log") {
+              Get-Content "C:\cloudflared-error.log"
+          }
+
+          throw "Cloudflare Tunnel failed."
+      }
+
+      $TunnelUrl |
+        Out-File "C:\hermes-url.txt"
+
+      Write-Host ""
+      Write-Host "=========================================="
+      Write-Host " HERMES WEB TERMINAL"
+      Write-Host "=========================================="
+      Write-Host ""
+      Write-Host $TunnelUrl
+      Write-Host ""
+      Write-Host "=========================================="
+
+      # Telegram notification
+      if (
+        $env:TELEGRAM_BOT_TOKEN -and
+        $env:TELEGRAM_CHAT_ID
+      ) {
+
+          $message = @"
+      🟢 Windows Hermes Runner Ready
+
+      Web Terminal:
+      $TunnelUrl
+
+      Workspace:
+      C:\HermesWorkspace
+
+      First commands:
+
+      hermes setup
+
+      then:
+
+      hermes model
+
+      "@
+
+          try {
+
+              Invoke-RestMethod `
+                -Uri "https://api.telegram.org/bot$($env:TELEGRAM_BOT_TOKEN)/sendMessage" `
+                -Method Post `
+                -Body @{
+                  chat_id = $env:TELEGRAM_CHAT_ID
+                  text = $message
+                }
+
+              Write-Host "Telegram notification sent."
+
+          }
+          catch {
+
+              Write-Warning "Telegram notification failed."
+              Write-Warning $_
+          }
+      }
+
+  # ============================================================
+  # 9. Keep Everything Alive
+  # ============================================================
+  - name: Keep Session Alive
+    shell: pwsh
+    run: |
+      Write-Host ""
+      Write-Host "=========================================="
+      Write-Host " HERMES ENVIRONMENT RUNNING"
+      Write-Host "=========================================="
+
+      Write-Host ""
+
+      if (Test-Path "C:\hermes-url.txt") {
+          Write-Host "WEB TERMINAL:"
+          Get-Content "C:\hermes-url.txt"
+      }
+
+      Write-Host ""
+      Write-Host "Checking services every 30 seconds..."
+      Write-Host ""
+
+      while ($true) {
+
+          Start-Sleep -Seconds 30
+
+          # ttyd health
+          $ttyd = Test-NetConnection `
+            -ComputerName 127.0.0.1 `
+            -Port 7681 `
+            -WarningAction SilentlyContinue
+
+          if (-not $ttyd.TcpTestSucceeded) {
+              Write-Error "ttyd is no longer listening."
+              exit 1
+          }
+
+          # Process health
+          if (Test-Path "C:\ttyd.pid") {
+
+              $pid = [int](Get-Content "C:\ttyd.pid")
+
+              if (-not (
+                Get-Process `
+                  -Id $pid `
+                  -ErrorAction SilentlyContinue
+              )) {
+                  Write-Error "ttyd process stopped."
+                  exit 1
+              }
+          }
+
+          if (Test-Path "C:\cloudflared.pid") {
+
+              $pid = [int](Get-Content "C:\cloudflared.pid")
+
+              if (-not (
+                Get-Process `
+                  -Id $pid `
+                  -ErrorAction SilentlyContinue
+              )) {
+                  Write-Error "cloudflared process stopped."
+                  exit 1
+              }
+          }
+
+          Write-Host `
+            "$(Get-Date -Format 'HH:mm:ss') - Services OK"
+      }
