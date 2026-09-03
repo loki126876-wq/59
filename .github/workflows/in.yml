@@ -1,0 +1,1275 @@
+name: Windows Hermes Agent - Mobile Terminal
+
+on:
+  workflow_dispatch:
+
+jobs:
+  hermes:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+
+      # ==========================================================
+      # 1. Install Hermes Agent
+      # ==========================================================
+      - name: Install Hermes Agent
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "========================================"
+          Write-Host " Installing Hermes Agent"
+          Write-Host "========================================"
+
+          # Official Windows installer
+          iex (irm https://hermes-agent.nousresearch.com/install.ps1)
+
+          Write-Host ""
+          Write-Host "Hermes installation finished."
+
+          # Locate Hermes executable
+          $hermesCandidates = @(
+            "$env:LOCALAPPDATA\hermes\hermes-agent\venv\Scripts\hermes.exe",
+            "$env:LOCALAPPDATA\hermes\bin\hermes.exe"
+          )
+
+          $hermesExe = $null
+
+          foreach ($candidate in $hermesCandidates) {
+            if (Test-Path $candidate) {
+              $hermesExe = $candidate
+              break
+            }
+          }
+
+          if (-not $hermesExe) {
+            Write-Host "Searching for hermes.exe..."
+
+            $found = Get-ChildItem `
+              "$env:LOCALAPPDATA\hermes" `
+              -Filter "hermes.exe" `
+              -Recurse `
+              -ErrorAction SilentlyContinue |
+              Select-Object -First 1
+
+            if ($found) {
+              $hermesExe = $found.FullName
+            }
+          }
+
+          if (-not $hermesExe) {
+            throw "Hermes executable was not found."
+          }
+
+          Write-Host "Hermes executable:"
+          Write-Host $hermesExe
+
+          # Persist PATH for all following steps
+          $hermesDir = Split-Path $hermesExe -Parent
+
+          "$hermesDir" | Out-File `
+            -FilePath $env:GITHUB_PATH `
+            -Encoding utf8
+
+          # Also update current process
+          $env:PATH = "$hermesDir;$env:PATH"
+
+          Write-Host ""
+          Write-Host "Hermes version:"
+          & $hermesExe --version
+
+
+      # ==========================================================
+      # 2. Verify Hermes
+      # ==========================================================
+      - name: Verify Hermes
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Checking Hermes..."
+
+          $hermes = Get-Command hermes -ErrorAction SilentlyContinue
+
+          if (-not $hermes) {
+            throw "Hermes is not available in PATH."
+          }
+
+          Write-Host "Hermes path:"
+          Write-Host $hermes.Source
+
+          Write-Host ""
+          Write-Host "Hermes version:"
+          hermes --version
+
+
+      # ==========================================================
+      # 3. Prepare Workspace
+      # ==========================================================
+      - name: Prepare Hermes Workspace
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path "C:\HermesWorkspace" |
+            Out-Null
+
+          @"
+          ==================================================
+          Hermes Agent - GitHub Windows Runner
+          ==================================================
+
+          Workspace:
+          C:\HermesWorkspace
+
+          Hermes home:
+          $env:LOCALAPPDATA\hermes
+
+          Useful commands:
+
+          hermes setup
+          hermes model
+          hermes doctor
+          hermes
+
+          ==================================================
+          "@ |
+            Out-File `
+              -FilePath "C:\HermesWorkspace\README.txt" `
+              -Encoding utf8
+
+
+      # ==========================================================
+      # 4. Install ttyd
+      # ==========================================================
+      - name: Install ttyd
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Downloading ttyd..."
+
+          Invoke-WebRequest `
+            -Uri "https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.win32.exe" `
+            -OutFile "C:\ttyd.exe"
+
+          if (-not (Test-Path "C:\ttyd.exe")) {
+            throw "ttyd download failed."
+          }
+
+          & "C:\ttyd.exe" --version
+
+
+      # ==========================================================
+      # 5. Install Cloudflared
+      # ==========================================================
+      - name: Install Cloudflared
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          choco install cloudflared -y --no-progress
+
+          cloudflared --version
+
+
+      # ==========================================================
+      # 6. Install Python WebSocket Proxy Dependencies
+      # ==========================================================
+      - name: Install Web Terminal Server
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          python -m pip install --upgrade pip
+
+          python -m pip install aiohttp
+
+          python --version
+
+          python -c "import aiohttp; print('aiohttp OK')"
+
+
+      # ==========================================================
+      # 7. Create Mobile Terminal + ttyd WebSocket Proxy
+      # ==========================================================
+      - name: Create Mobile Terminal
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          New-Item `
+            -ItemType Directory `
+            -Force `
+            -Path "C:\HermesTerminal" |
+            Out-Null
+
+          # ------------------------------------------------------
+          # Python WebSocket proxy
+          #
+          # Browser
+          #    ↓
+          # localhost:8080
+          #    ↓
+          # Python proxy
+          #    ↓
+          # ttyd :7681
+          #
+          # This also allows the mobile buttons to send real
+          # ttyd INPUT packets.
+          # ------------------------------------------------------
+
+          @'
+          import asyncio
+          import os
+
+          from aiohttp import web, ClientSession, WSMsgType
+
+
+          TTYD_URL = "http://127.0.0.1:7681"
+          TTYD_WS = "ws://127.0.0.1:7681/ws"
+
+
+          HTML = r"""
+          <!DOCTYPE html>
+
+          <html>
+          <head>
+
+            <meta charset="UTF-8">
+
+            <meta
+              name="viewport"
+              content="width=device-width,
+                       initial-scale=1,
+                       maximum-scale=1,
+                       user-scalable=no">
+
+            <meta
+              name="theme-color"
+              content="#111318">
+
+            <title>Hermes Terminal</title>
+
+            <link
+              rel="stylesheet"
+              href="https://cdn.jsdelivr.net/npm/xterm@5.3.0/css/xterm.css">
+
+            <style>
+
+              * {
+                box-sizing: border-box;
+              }
+
+              html,
+              body {
+                margin: 0;
+                padding: 0;
+                width: 100%;
+                height: 100%;
+                overflow: hidden;
+                background: #111318;
+              }
+
+              body {
+                font-family:
+                  -apple-system,
+                  BlinkMacSystemFont,
+                  "Segoe UI",
+                  sans-serif;
+              }
+
+              #app {
+                width: 100%;
+                height: 100%;
+                display: flex;
+                flex-direction: column;
+              }
+
+              #toolbar {
+
+                flex-shrink: 0;
+
+                display: flex;
+
+                gap: 6px;
+
+                padding: 7px;
+
+                background: #1b1e26;
+
+                border-bottom:
+                  1px solid #343946;
+
+                overflow-x: auto;
+
+                -webkit-overflow-scrolling: touch;
+
+                scrollbar-width: none;
+              }
+
+              #toolbar::-webkit-scrollbar {
+                display: none;
+              }
+
+              .key {
+
+                flex: 0 0 auto;
+
+                min-width: 58px;
+
+                height: 42px;
+
+                border-radius: 8px;
+
+                border:
+                  1px solid #4a5060;
+
+                background: #292e39;
+
+                color: #fff;
+
+                font-size: 14px;
+
+                font-weight: 600;
+
+                touch-action: manipulation;
+
+                user-select: none;
+
+                -webkit-user-select: none;
+
+                display: flex;
+
+                align-items: center;
+
+                justify-content: center;
+              }
+
+              .key:active {
+
+                transform: scale(.94);
+
+                background: #454c5c;
+              }
+
+              .danger {
+
+                background: #8e3d48;
+
+                border-color: #b65a67;
+              }
+
+              .primary {
+
+                background: #385b83;
+
+                border-color: #557fae;
+              }
+
+              #terminal {
+
+                flex: 1;
+
+                min-height: 0;
+
+                width: 100%;
+
+                padding: 4px;
+
+                background: #000;
+              }
+
+              #status {
+
+                position: fixed;
+
+                right: 8px;
+
+                bottom: 8px;
+
+                padding: 5px 8px;
+
+                border-radius: 6px;
+
+                background:
+                  rgba(0,0,0,.65);
+
+                color: #aaa;
+
+                font-size: 11px;
+
+                pointer-events: none;
+              }
+
+            </style>
+
+          </head>
+
+          <body>
+
+            <div id="app">
+
+              <div id="toolbar">
+
+                <div
+                  class="key danger"
+                  onclick="sendKey('CTRL_C')">
+                  Ctrl+C
+                </div>
+
+                <div
+                  class="key primary"
+                  onclick="sendKey('UP')">
+                  ▲
+                </div>
+
+                <div
+                  class="key primary"
+                  onclick="sendKey('DOWN')">
+                  ▼
+                </div>
+
+                <div
+                  class="key"
+                  onclick="sendKey('LEFT')">
+                  ◀
+                </div>
+
+                <div
+                  class="key"
+                  onclick="sendKey('RIGHT')">
+                  ▶
+                </div>
+
+                <div
+                  class="key"
+                  onclick="sendKey('TAB')">
+                  TAB
+                </div>
+
+                <div
+                  class="key"
+                  onclick="sendKey('ESC')">
+                  ESC
+                </div>
+
+                <div
+                  class="key primary"
+                  onclick="sendKey('ENTER')">
+                  ENTER
+                </div>
+
+                <div
+                  class="key"
+                  onclick="sendKey('BACKSPACE')">
+                  ⌫
+                </div>
+
+              </div>
+
+              <div id="terminal"></div>
+
+            </div>
+
+            <div id="status">
+              Connecting...
+            </div>
+
+
+            <script
+              src="https://cdn.jsdelivr.net/npm/xterm@5.3.0/lib/xterm.js">
+            </script>
+
+
+            <script>
+
+              const term =
+                new Terminal({
+
+                  cursorBlink: true,
+
+                  fontSize: 14,
+
+                  scrollback: 5000,
+
+                  convertEol: true,
+
+                  theme: {
+
+                    background: "#000000",
+
+                    foreground: "#eeeeee",
+
+                    cursor: "#ffffff"
+
+                  }
+
+                });
+
+
+              term.open(
+                document.getElementById("terminal")
+              );
+
+
+              let socket = null;
+
+
+              function setStatus(text) {
+
+                document.getElementById(
+                  "status"
+                ).textContent = text;
+
+              }
+
+
+              function connect() {
+
+                const protocol =
+                  location.protocol === "https:"
+                    ? "wss:"
+                    : "ws:";
+
+
+                socket = new WebSocket(
+                  protocol +
+                  "//" +
+                  location.host +
+                  "/ws"
+                );
+
+
+                socket.binaryType =
+                  "arraybuffer";
+
+
+                socket.onopen = function() {
+
+                  setStatus("Connected");
+
+                  sendResize();
+
+                  term.focus();
+
+                };
+
+
+                socket.onmessage =
+                  function(event) {
+
+                    if (
+                      typeof event.data === "string"
+                    ) {
+
+                      term.write(event.data);
+
+                      return;
+
+                    }
+
+
+                    const data =
+                      new Uint8Array(event.data);
+
+
+                    if (data.length < 1)
+                      return;
+
+
+                    const type =
+                      String.fromCharCode(data[0]);
+
+
+                    // ttyd OUTPUT packet
+                    if (type === "0") {
+
+                      term.write(
+                        data.slice(1)
+                      );
+
+                    }
+
+                  };
+
+
+                socket.onclose =
+                  function() {
+
+                    setStatus(
+                      "Disconnected - reconnecting..."
+                    );
+
+                    setTimeout(
+                      connect,
+                      1500
+                    );
+
+                  };
+
+
+                socket.onerror =
+                  function() {
+
+                    setStatus("Connection error");
+
+                  };
+
+              }
+
+
+              function sendRaw(bytes) {
+
+                if (
+                  socket &&
+                  socket.readyState === WebSocket.OPEN
+                ) {
+
+                  const packet =
+                    new Uint8Array(
+                      bytes.length + 1
+                    );
+
+                  // ttyd INPUT = '0'
+                  packet[0] = 48;
+
+                  packet.set(
+                    bytes,
+                    1
+                  );
+
+                  socket.send(packet);
+
+                  term.focus();
+
+                }
+
+              }
+
+
+              function sendText(text) {
+
+                const bytes =
+                  new TextEncoder().encode(text);
+
+                sendRaw(bytes);
+
+              }
+
+
+              function sendKey(key) {
+
+                switch (key) {
+
+                  case "CTRL_C":
+                    sendText("\x03");
+                    break;
+
+                  case "UP":
+                    sendText("\x1b[A");
+                    break;
+
+                  case "DOWN":
+                    sendText("\x1b[B");
+                    break;
+
+                  case "RIGHT":
+                    sendText("\x1b[C");
+                    break;
+
+                  case "LEFT":
+                    sendText("\x1b[D");
+                    break;
+
+                  case "TAB":
+                    sendText("\x09");
+                    break;
+
+                  case "ESC":
+                    sendText("\x1b");
+                    break;
+
+                  case "ENTER":
+                    sendText("\r");
+                    break;
+
+                  case "BACKSPACE":
+                    sendText("\x7f");
+                    break;
+
+                }
+
+              }
+
+
+              term.onData(
+                function(data) {
+
+                  sendText(data);
+
+                }
+              );
+
+
+              function sendResize() {
+
+                if (
+                  !socket ||
+                  socket.readyState !== WebSocket.OPEN
+                )
+                  return;
+
+
+                const cols =
+                  term.cols || 80;
+
+                const rows =
+                  term.rows || 24;
+
+
+                const message =
+                  JSON.stringify({
+
+                    columns: cols,
+
+                    rows: rows
+
+                  });
+
+
+                const text =
+                  "1" + message;
+
+
+                const bytes =
+                  new TextEncoder().encode(text);
+
+
+                socket.send(bytes);
+
+              }
+
+
+              window.addEventListener(
+                "resize",
+                function() {
+
+                  setTimeout(
+                    sendResize,
+                    100
+                  );
+
+                }
+              );
+
+
+              connect();
+
+            </script>
+
+          </body>
+          </html>
+          """
+
+
+          async def index(request):
+              return web.Response(
+                  text=HTML,
+                  content_type="text/html"
+              )
+
+
+          async def websocket_proxy(request):
+
+              client_ws = web.WebSocketResponse()
+              await client_ws.prepare(request)
+
+              try:
+
+                  async with ClientSession() as session:
+
+                      async with session.ws_connect(
+                          TTYD_WS,
+                          heartbeat=20
+                      ) as tty_ws:
+
+
+                          async def browser_to_tty():
+
+                              async for msg in client_ws:
+
+                                  if msg.type == WSMsgType.BINARY:
+
+                                      await tty_ws.send_bytes(
+                                          msg.data
+                                      )
+
+                                  elif msg.type == WSMsgType.TEXT:
+
+                                      await tty_ws.send_str(
+                                          msg.data
+                                      )
+
+                                  elif msg.type == WSMsgType.CLOSE:
+
+                                      break
+
+
+                          async def tty_to_browser():
+
+                              async for msg in tty_ws:
+
+                                  if msg.type == WSMsgType.BINARY:
+
+                                      await client_ws.send_bytes(
+                                          msg.data
+                                      )
+
+                                  elif msg.type == WSMsgType.TEXT:
+
+                                      await client_ws.send_str(
+                                          msg.data
+                                      )
+
+                                  elif msg.type in (
+                                      WSMsgType.CLOSE,
+                                      WSMsgType.ERROR
+                                  ):
+
+                                      break
+
+
+                          await asyncio.gather(
+                              browser_to_tty(),
+                              tty_to_browser()
+                          )
+
+              except Exception as e:
+
+                  print(
+                      "WebSocket proxy error:",
+                      repr(e)
+                  )
+
+              finally:
+
+                  if not client_ws.closed:
+
+                      await client_ws.close()
+
+              return client_ws
+
+
+          app = web.Application()
+
+          app.router.add_get(
+              "/",
+              index
+          )
+
+          app.router.add_get(
+              "/ws",
+              websocket_proxy
+          )
+
+
+          web.run_app(
+              app,
+              host="127.0.0.1",
+              port=8080
+          )
+
+          '@ |
+            Out-File `
+              -FilePath "C:\HermesTerminal\server.py" `
+              -Encoding utf8
+
+
+      # ==========================================================
+      # 8. Start ttyd
+      # ==========================================================
+      - name: Start ttyd
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Starting ttyd..."
+
+          $args = @(
+            "-p", "7681",
+            "-i", "127.0.0.1",
+            "-W",
+            "-w", "C:\HermesWorkspace",
+            "-P", "5",
+            "-t", "fontSize=14",
+            "powershell.exe",
+            "-NoLogo",
+            "-NoExit"
+          )
+
+          $process = Start-Process `
+            -FilePath "C:\ttyd.exe" `
+            -ArgumentList $args `
+            -RedirectStandardOutput "C:\ttyd.log" `
+            -RedirectStandardError "C:\ttyd-error.log" `
+            -PassThru
+
+          $process.Id |
+            Out-File "C:\ttyd.pid"
+
+          Write-Host "ttyd PID: $($process.Id)"
+
+          $ready = $false
+
+          for ($i = 1; $i -le 30; $i++) {
+
+            Start-Sleep -Seconds 1
+
+            $test = Test-NetConnection `
+              -ComputerName 127.0.0.1 `
+              -Port 7681 `
+              -WarningAction SilentlyContinue
+
+            if ($test.TcpTestSucceeded) {
+
+              $ready = $true
+
+              break
+            }
+
+          }
+
+          if (-not $ready) {
+
+            Write-Host "===== ttyd log ====="
+
+            if (Test-Path "C:\ttyd.log") {
+              Get-Content "C:\ttyd.log"
+            }
+
+            Write-Host "===== ttyd error ====="
+
+            if (Test-Path "C:\ttyd-error.log") {
+              Get-Content "C:\ttyd-error.log"
+            }
+
+            throw "ttyd failed to start."
+          }
+
+          Write-Host "ttyd is ready."
+
+
+      # ==========================================================
+      # 9. Start Web Terminal Server
+      # ==========================================================
+      - name: Start Web Terminal Server
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Write-Host "Starting mobile terminal server..."
+
+          $process = Start-Process `
+            -FilePath "python" `
+            -ArgumentList @(
+              "C:\HermesTerminal\server.py"
+            ) `
+            -RedirectStandardOutput "C:\terminal.log" `
+            -RedirectStandardError "C:\terminal-error.log" `
+            -PassThru
+
+          $process.Id |
+            Out-File "C:\terminal.pid"
+
+          Write-Host "Terminal server PID: $($process.Id)"
+
+          $ready = $false
+
+          for ($i = 1; $i -le 30; $i++) {
+
+            Start-Sleep -Seconds 1
+
+            $test = Test-NetConnection `
+              -ComputerName 127.0.0.1 `
+              -Port 8080 `
+              -WarningAction SilentlyContinue
+
+            if ($test.TcpTestSucceeded) {
+
+              $ready = $true
+
+              break
+            }
+
+          }
+
+          if (-not $ready) {
+
+            Write-Host "===== terminal log ====="
+
+            if (Test-Path "C:\terminal.log") {
+              Get-Content "C:\terminal.log"
+            }
+
+            Write-Host "===== terminal error ====="
+
+            if (Test-Path "C:\terminal-error.log") {
+              Get-Content "C:\terminal-error.log"
+            }
+
+            throw "Web terminal server failed."
+          }
+
+          Write-Host "Mobile terminal server is ready."
+
+
+      # ==========================================================
+      # 10. Start Cloudflare Tunnel
+      # ==========================================================
+      - name: Start Cloudflare Tunnel
+        shell: pwsh
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $log = "C:\cloudflared.log"
+
+          if (Test-Path $log) {
+            Remove-Item $log -Force
+          }
+
+          Write-Host "Starting Cloudflare Quick Tunnel..."
+
+          $process = Start-Process `
+            -FilePath "cloudflared" `
+            -ArgumentList @(
+              "tunnel",
+              "--no-autoupdate",
+              "--url",
+              "http://127.0.0.1:8080"
+            ) `
+            -RedirectStandardOutput $log `
+            -RedirectStandardError "C:\cloudflared-error.log" `
+            -PassThru
+
+          $process.Id |
+            Out-File "C:\cloudflared.pid"
+
+          Write-Host "cloudflared PID: $($process.Id)"
+
+          $TunnelUrl = $null
+
+          for ($i = 1; $i -le 60; $i++) {
+
+            Start-Sleep -Seconds 2
+
+            $combined = ""
+
+            if (Test-Path $log) {
+              $combined += Get-Content $log -Raw
+            }
+
+            if (Test-Path "C:\cloudflared-error.log") {
+              $combined += Get-Content `
+                "C:\cloudflared-error.log" `
+                -Raw
+            }
+
+            $match = [regex]::Match(
+              $combined,
+              'https://[a-zA-Z0-9-]+\.trycloudflare\.com'
+            )
+
+            if ($match.Success) {
+
+              $TunnelUrl = $match.Value
+
+              break
+            }
+
+            Write-Host `
+              "Waiting for Cloudflare... $i/60"
+          }
+
+          if (-not $TunnelUrl) {
+
+            Write-Host "===== cloudflared stdout ====="
+
+            if (Test-Path $log) {
+              Get-Content $log
+            }
+
+            Write-Host "===== cloudflared stderr ====="
+
+            if (Test-Path "C:\cloudflared-error.log") {
+              Get-Content "C:\cloudflared-error.log"
+            }
+
+            throw "Cloudflare Tunnel URL was not created."
+          }
+
+          $TunnelUrl |
+            Out-File `
+              -FilePath "C:\hermes-url.txt" `
+              -Encoding utf8
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host " HERMES WEB TERMINAL"
+          Write-Host "=========================================="
+          Write-Host ""
+          Write-Host $TunnelUrl
+          Write-Host ""
+          Write-Host "=========================================="
+
+          # Telegram
+          if (
+            $env:TELEGRAM_BOT_TOKEN -and
+            $env:TELEGRAM_CHAT_ID
+          ) {
+
+            $message = @"
+          🟢 Windows Hermes Runner Ready
+
+          Web Terminal:
+          $TunnelUrl
+
+          Workspace:
+          C:\HermesWorkspace
+
+          First commands:
+
+          hermes setup
+
+          then:
+
+          hermes model
+
+          "@
+
+            try {
+
+              Invoke-RestMethod `
+                -Uri "https://api.telegram.org/bot$($env:TELEGRAM_BOT_TOKEN)/sendMessage" `
+                -Method Post `
+                -Body @{
+                  chat_id = $env:TELEGRAM_CHAT_ID
+                  text = $message
+                }
+
+              Write-Host "Telegram notification sent."
+
+            }
+            catch {
+
+              Write-Warning `
+                "Telegram notification failed."
+
+              Write-Warning $_
+            }
+          }
+
+
+      # ==========================================================
+      # 11. Keep Runner Alive
+      # ==========================================================
+      - name: Keep Runner Alive
+        shell: pwsh
+        run: |
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host " HERMES IS RUNNING"
+          Write-Host "=========================================="
+          Write-Host ""
+
+          if (Test-Path "C:\hermes-url.txt") {
+
+            Write-Host "WEB TERMINAL:"
+            Get-Content "C:\hermes-url.txt"
+
+          }
+
+          Write-Host ""
+          Write-Host "Runner is alive."
+          Write-Host ""
+
+          while ($true) {
+
+            Start-Sleep -Seconds 30
+
+            # ttyd
+            $ttydTest = Test-NetConnection `
+              -ComputerName 127.0.0.1 `
+              -Port 7681 `
+              -WarningAction SilentlyContinue
+
+            if (-not $ttydTest.TcpTestSucceeded) {
+
+              Write-Error `
+                "ttyd stopped listening."
+
+              exit 1
+            }
+
+            # Web terminal
+            $terminalTest = Test-NetConnection `
+              -ComputerName 127.0.0.1 `
+              -Port 8080 `
+              -WarningAction SilentlyContinue
+
+            if (-not $terminalTest.TcpTestSucceeded) {
+
+              Write-Error `
+                "Web terminal stopped listening."
+
+              exit 1
+            }
+
+            # ttyd process
+            if (Test-Path "C:\ttyd.pid") {
+
+              $ttydPid =
+                [int](Get-Content "C:\ttyd.pid")
+
+              if (-not (
+                Get-Process `
+                  -Id $ttydPid `
+                  -ErrorAction SilentlyContinue
+              )) {
+
+                Write-Error `
+                  "ttyd process stopped."
+
+                exit 1
+              }
+            }
+
+            # Cloudflare process
+            if (Test-Path "C:\cloudflared.pid") {
+
+              $cfPid =
+                [int](Get-Content "C:\cloudflared.pid")
+
+              if (-not (
+                Get-Process `
+                  -Id $cfPid `
+                  -ErrorAction SilentlyContinue
+              )) {
+
+                Write-Error `
+                  "cloudflared process stopped."
+
+                exit 1
+              }
+            }
+
+            Write-Host `
+              "$(Get-Date -Format 'HH:mm:ss') - All services OK"
+          }
